@@ -1,0 +1,15 @@
+# smtp-wg-tunnel — user database
+# Add one entry per user/device.
+# Generate a strong secret: python -c "import secrets; print(secrets.token_urlsafe(32))"
+# Or:                        python server.py --add-user youruser
+
+users:
+  youruser:
+    secret: "CHANGE-ME-replace-with-a-random-secret"
+
+  # Add more users as needed:
+  # laptop:
+  #   secret: "another-random-secret"
+  #
+  # phone:
+  #   secret: "yet-another-random-secret"

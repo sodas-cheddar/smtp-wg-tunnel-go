@@ -1,0 +1,26 @@
+# smtp-wg-tunnel — server configuration
+# Run: python server.py -c server_config.yaml
+
+server:
+  # Interface to listen on
+  host: "0.0.0.0"
+
+  # Port — 587 (SMTP submission) is the most convincing disguise.
+  # Port 465 (SMTPS) also works. Avoid 25 — often blocked upstream.
+  port: 587
+
+  # Hostname used in the SMTP banner and must match your TLS certificate CN/SAN.
+  # Use a real FQDN (free: DuckDNS, No-IP, FreeDNS).
+  hostname: "mail.yourserver.duckdns.org"
+
+  # TLS certificates — generate with: python generate_certs.py <hostname>
+  cert_file: "server.crt"
+  key_file:  "server.key"
+
+  # Where WireGuard is actually listening on this machine.
+  # Typically 127.0.0.1:51820 if WG is local, or 0.0.0.0:51820.
+  wg_host: "127.0.0.1"
+  wg_port: 51820
+
+  # User database
+  users_file: "users.yaml"
