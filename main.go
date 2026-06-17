@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 )
 
@@ -89,6 +90,7 @@ func serverCmd(args []string) {
 func clientCmd(args []string) {
 	fs := flag.NewFlagSet("client", flag.ExitOnError)
 	configPath := fs.String("c", "client_config.yaml", "client config file")
+	wgConfig   := fs.String("wg", "", "path to wg0.conf — enables embedded WireGuard (no WireGuard-Windows needed)")
 	_ = fs.Bool("d", false, "debug logging (reserved)")
 	fs.Parse(args)
 
@@ -114,6 +116,23 @@ func clientCmd(args []string) {
 		os.Exit(0)
 	}()
 
+	if *wgConfig != "" {
+		wgCfg, err := parseWGConfig(*wgConfig)
+		if err != nil {
+			log.Fatalf("WireGuard config: %v", err)
+		}
+		if len(wgCfg.Peers) == 0 {
+			log.Fatal("wg0.conf has no [Peer] section")
+		}
+		log.Printf("Embedded WireGuard mode — config: %s", *wgConfig)
+		log.Printf("Peer: %s…  AllowedIPs: %s",
+			wgCfg.Peers[0].PublicKey[:8],
+			strings.Join(wgCfg.Peers[0].AllowedIPs, ", "))
+		cl.RunWGMode(wgCfg)
+		return
+	}
+
+	// Legacy UDP proxy mode (WireGuard-Windows app points Endpoint here)
 	cl.Run()
 }
 

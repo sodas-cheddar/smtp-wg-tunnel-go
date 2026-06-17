@@ -19,7 +19,7 @@ import (
 
 type Client struct {
 	cfg  *ClientConfig
-	udp  *net.UDPConn // bound once in Run(), reused across reconnects
+	udp  *net.UDPConn // bound once in Run(), shared across reconnects
 	stop chan struct{}
 }
 
@@ -27,16 +27,11 @@ func NewClient(cfg *ClientConfig) *Client {
 	return &Client{cfg: cfg, stop: make(chan struct{})}
 }
 
-func (c *Client) Stop() {
-	close(c.stop)
-}
+func (c *Client) Stop() { close(c.stop) }
 
 func (c *Client) Run() {
 	cfg := c.cfg
 
-	// Bind the local UDP socket once. WireGuard points its Endpoint here.
-	// The socket persists across TLS reconnections so WireGuard doesn't
-	// need to restart when the tunnel drops.
 	udp, err := net.ListenUDP("udp", &net.UDPAddr{
 		IP:   net.ParseIP(cfg.LocalWGHost),
 		Port: cfg.LocalWGPort,
@@ -78,10 +73,6 @@ func (c *Client) Run() {
 
 // ── Handshake ──────────────────────────────────────────────────────────────────
 
-// connect performs the full SMTP STARTTLS handshake and returns a live TLS
-// connection plus a buffered reader that MUST be used for all subsequent reads.
-// The buffered reader may contain tunnel bytes already read from the TLS stream
-// during the post-handshake SMTP exchange — discarding it would lose those bytes.
 func (c *Client) connect() (*tls.Conn, *bufio.Reader, error) {
 	cfg := c.cfg
 	addr := fmt.Sprintf("%s:%d", cfg.ServerHost, cfg.ServerPort)
@@ -99,34 +90,26 @@ func (c *Client) connect() (*tls.Conn, *bufio.Reader, error) {
 		tc.SetWriteBuffer(4 * 1024 * 1024)
 	}
 
-	// readLine reads one CRLF-terminated line directly from raw conn,
-	// one byte at a time, to avoid buffering across the TLS upgrade.
-	readLine := func(timeout time.Duration) (string, error) {
-		return readLineRaw(raw, timeout)
-	}
-	drainSMTP := func() error {
-		return drainRaw(raw, 30*time.Second)
-	}
-
-	// ── Phase 1: Pre-TLS SMTP ──────────────────────────────────────────────
-	greeting, err := readLine(30 * time.Second)
+	greeting, err := readLineRaw(raw, 30*time.Second)
 	if err != nil || !strings.HasPrefix(greeting, "220") {
 		raw.Close()
 		return nil, nil, fmt.Errorf("greeting: %q %v", greeting, err)
 	}
+
 	raw.Write([]byte("EHLO client.local\r\n"))
-	if err := drainSMTP(); err != nil {
+	if err := drainRaw(raw); err != nil {
 		raw.Close()
 		return nil, nil, fmt.Errorf("EHLO: %w", err)
 	}
+
 	raw.Write([]byte("STARTTLS\r\n"))
-	resp, err := readLine(30 * time.Second)
+	resp, err := readLineRaw(raw, 30*time.Second)
 	if err != nil || !strings.HasPrefix(resp, "220") {
 		raw.Close()
 		return nil, nil, fmt.Errorf("STARTTLS: %q %v", resp, err)
 	}
 
-	// ── Phase 2: TLS upgrade ────────────────────────────────────────────────
+	// TLS upgrade
 	tlsCfg, err := c.buildTLSConfig()
 	if err != nil {
 		raw.Close()
@@ -140,8 +123,8 @@ func (c *Client) connect() (*tls.Conn, *bufio.Reader, error) {
 	}
 	tlsConn.SetDeadline(time.Time{})
 
-	// Create the buffered reader HERE. Every subsequent read must go
-	// through this reader to avoid losing bytes buffered from TLS.
+	// All subsequent reads go through this buffer — it may contain tunnel
+	// bytes buffered during the post-handshake SMTP exchange
 	br := bufio.NewReaderSize(tlsConn, 2*1024*1024)
 
 	readTLSLine := func() (string, error) {
@@ -162,7 +145,6 @@ func (c *Client) connect() (*tls.Conn, *bufio.Reader, error) {
 		}
 	}
 
-	// ── Phase 3: Post-TLS SMTP ──────────────────────────────────────────────
 	tlsConn.Write([]byte("EHLO client.local\r\n"))
 	if err := drainTLS(); err != nil {
 		tlsConn.Close()
@@ -218,9 +200,6 @@ func (c *Client) buildTLSConfig() (*tls.Config, error) {
 func (c *Client) runTunnel(tlsConn *tls.Conn, br *bufio.Reader) {
 	defer tlsConn.Close()
 
-	// wgPeer: the WireGuard kernel's source address.
-	// Set atomically by the upload goroutine, read by the download goroutine.
-	// atomic.Pointer[T] is safe without a mutex for pointer-sized updates.
 	var wgPeer atomic.Pointer[net.UDPAddr]
 
 	// Stats
@@ -246,56 +225,109 @@ func (c *Client) runTunnel(tlsConn *tls.Conn, br *bufio.Reader) {
 	}()
 	defer close(statsDone)
 
-	// writeMu serialises concurrent TLS writes (upload data + keepalives)
-	var writeMu sync.Mutex
-	tlsWrite := func(b []byte) error {
-		writeMu.Lock()
-		defer writeMu.Unlock()
-		_, err := tlsConn.Write(b)
-		return err
-	}
-
 	errCh := make(chan error, 2)
+	var wg sync.WaitGroup
 
-	// ── Upload goroutine: WireGuard → TLS ──────────────────────────────────
-	// Reads WireGuard datagrams from the shared UDP socket, prepends the
-	// 2-byte length header in-place (no extra allocation), and sends via TLS.
-	// ReadFromUDP blocks until a packet arrives; a 20 s deadline triggers
-	// a keepalive write if no traffic flows (holds the NAT mapping open).
-	go func() {
-		frame := make([]byte, frameHdrSize+maxPacketSize) // reused every iteration
-		pkt := frame[frameHdrSize:]
+	// ── Upload: WireGuard → TLS (batched) ──────────────────────────────────
+	//
+	// THE CORE FIX: per-tlsConn.Write() overhead is ~440 µs on Windows,
+	// capping single-packet sends at ~2,272 pps = 25 Mbps. Batching all
+	// packets accumulated over a 1 ms window into one Write reduces the
+	// call rate to ~1,000/sec, well within budget for 150 Mbps.
+	//
+	// Stage 1 (reader): pure blocking ReadFromUDP — no deadline, no per-
+	// packet overhead. Feeds a deep channel so it is never stalled by the
+	// TLS sender.
+	//
+	// Stage 2 (sender): drains the channel every millisecond (or when the
+	// batch reaches 48 KB) and issues a single tlsConn.Write per interval.
+	// Keepalives are sent from within this goroutine so no write mutex
+	// is needed — only one goroutine ever writes to tlsConn.
+
+	pktChUL := make(chan []byte, 1024)
+
+	wg.Add(1)
+	go func() { // Stage 1: UDP reader (no deadline — blocks until packet or socket closed)
+		defer wg.Done()
+		defer close(pktChUL)
+		buf := make([]byte, maxPacketSize)
 		for {
-			c.udp.SetReadDeadline(time.Now().Add(20 * time.Second))
-			n, addr, err := c.udp.ReadFromUDP(pkt)
+			n, addr, err := c.udp.ReadFromUDP(buf)
 			if err != nil {
-				if ne, ok := err.(net.Error); ok && ne.Timeout() {
-					if e2 := tlsWrite(keepaliveFrame); e2 != nil {
-						errCh <- e2
-						return
-					}
-					continue
-				}
-				errCh <- err
 				return
 			}
 			wgPeer.Store(addr)
-			atomic.AddInt64(&ulB, int64(n))
 			atomic.AddInt64(&ulP, 1)
-			writeFrame(frame, n)
-			if err := tlsWrite(frame[:frameHdrSize+n]); err != nil {
-				errCh <- err
-				return
+			atomic.AddInt64(&ulB, int64(n))
+			pkt := make([]byte, n)
+			copy(pkt, buf[:n])
+			select {
+			case pktChUL <- pkt:
+			default: // channel full: drop packet rather than stall the reader
 			}
 		}
 	}()
 
-	// ── Download goroutine: TLS → WireGuard ────────────────────────────────
+	wg.Add(1)
+	go func() { // Stage 2: batch TLS sender
+		defer wg.Done()
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		batch := make([]byte, 0, 64*1024)
+		var hdr [frameHdrSize]byte
+		lastSent := time.Now()
+
+		flush := func() bool {
+			if len(batch) == 0 {
+				return true
+			}
+			if _, err := tlsConn.Write(batch); err != nil {
+				errCh <- err
+				return false
+			}
+			batch = batch[:0]
+			lastSent = time.Now()
+			return true
+		}
+
+		for {
+			select {
+			case pkt, ok := <-pktChUL:
+				if !ok { // reader closed: flush and exit
+					flush()
+					return
+				}
+				writeFrame(hdr[:], len(pkt))
+				batch = append(batch, hdr[:]...)
+				batch = append(batch, pkt...)
+				if len(batch) >= 48*1024 { // eager flush at 48 KB
+					if !flush() {
+						return
+					}
+				}
+			case <-ticker.C:
+				if !flush() {
+					return
+				}
+				// Keepalive: hold the TLS connection and NAT mapping open
+				if time.Since(lastSent) > 19*time.Second {
+					if _, err := tlsConn.Write(keepaliveFrame); err != nil {
+						errCh <- err
+						return
+					}
+					lastSent = time.Now()
+				}
+			}
+		}
+	}()
+
+	// ── Download: TLS → WireGuard ───────────────────────────────────────────
 	// Reads length-prefixed frames from the buffered TLS reader and sends
-	// raw WireGuard datagrams back to the WireGuard kernel via UDP.
-	// Must use br (not tlsConn directly) — br may contain bytes buffered
-	// during the post-handshake SMTP exchange.
+	// individual UDP datagrams to WireGuard. UDP sends are cheap per-call
+	// so no batching is needed here.
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		hdr := make([]byte, frameHdrSize)
 		buf := make([]byte, maxPacketSize)
 		for {
@@ -305,7 +337,7 @@ func (c *Client) runTunnel(tlsConn *tls.Conn, br *bufio.Reader) {
 			}
 			n := readFrameLen(hdr)
 			if n == 0 {
-				continue // keepalive — discard
+				continue // keepalive
 			}
 			if _, err := io.ReadFull(br, buf[:n]); err != nil {
 				errCh <- err
@@ -318,18 +350,198 @@ func (c *Client) runTunnel(tlsConn *tls.Conn, br *bufio.Reader) {
 		}
 	}()
 
-	// Wait for first goroutine to stop
+	// Wait for first goroutine to report an error, then tear down all three
 	if err := <-errCh; err != nil && err != io.EOF &&
 		!strings.Contains(err.Error(), "use of closed") {
 		log.Printf("Tunnel: %v", err)
 	}
-
-	// Tear down:
-	// - Close tlsConn → unblocks io.ReadFull in download goroutine
-	// - Set immediate UDP deadline → unblocks ReadFromUDP in upload goroutine
-	//   (do NOT close c.udp — it's shared across reconnects)
-	tlsConn.Close()
+	tlsConn.Close() // unblocks TLS reader in download goroutine
+	// Unblock Stage-1 UDP reader without closing the shared socket:
+	// a past-due deadline causes ReadFromUDP to return immediately
 	c.udp.SetReadDeadline(time.Now())
-	<-errCh                            // drain second goroutine
-	c.udp.SetReadDeadline(time.Time{}) // clear deadline for next session
+	wg.Wait()
+	c.udp.SetReadDeadline(time.Time{}) // clear for next session
+}
+
+// ── WireGuard-go mode ──────────────────────────────────────────────────────────
+//
+// Runs when --wg flag is provided. wireguard-go IS the WireGuard implementation;
+// no external WireGuard-Windows app or UDP loopback needed.
+// The tunnelBind routes all WireGuard crypto frames through our SMTP tunnel.
+
+func (c *Client) RunWGMode(wgCfg *WGConfig) {
+	cfg := c.cfg
+
+	// Create TUN + wireguard-go with our custom bind
+	bind := newTunnelBind()
+	serverAddr := fmt.Sprintf("%s:%d", cfg.ServerHost, cfg.ServerPort)
+
+	tunDev, err := createAndConfigureTUN(wgCfg, cfg.ServerHost)
+	if err != nil {
+		log.Fatalf("TUN: %v", err)
+	}
+
+	dev, err := newWireGuardDevice(tunDev, bind, wgCfg, serverAddr)
+	if err != nil {
+		tunDev.Close()
+		log.Fatalf("WireGuard device: %v", err)
+	}
+	defer dev.Close()
+
+	log.Printf("Embedded WireGuard active — all traffic routes via SMTP tunnel to %s", serverAddr)
+	log.Printf("No WireGuard-Windows app needed.")
+
+	// Reconnect loop: SMTP tunnel reconnects transparently; wireguard-go
+	// keeps its TUN and crypto state across reconnects.
+	for {
+		select {
+		case <-c.stop:
+			return
+		default:
+		}
+
+		tlsConn, br, err := c.connect()
+		if err != nil {
+			log.Printf("Connection failed: %v", err)
+		} else {
+			bind.resetDone() // fresh session signal for ReceiveFunc
+			c.runTunnelWG(tlsConn, br, bind)
+		}
+
+		select {
+		case <-c.stop:
+			return
+		case <-time.After(cfg.ReconnectDelay):
+			log.Printf("Reconnecting in %v …", cfg.ReconnectDelay)
+		}
+	}
+}
+
+// runTunnelWG is the same as runTunnel but sources/sinks are the tunnelBind
+// channels instead of a UDP socket.
+//
+// Upload: bind.outCh  ← wireguard-go → batch → TLS write
+// Download: TLS read → decode frame → bind.deliver() → wireguard-go
+func (c *Client) runTunnelWG(tlsConn *tls.Conn, br *bufio.Reader, bind *tunnelBind) {
+	defer tlsConn.Close()
+
+	var ulB, dlB, ulP int64
+	t0 := time.Now()
+	statsDone := make(chan struct{})
+	go func() {
+		t := time.NewTicker(5 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				e := time.Since(t0).Seconds()
+				log.Printf("stats  ul=%.1f Mbps  dl=%.1f Mbps  wg_pps=%.0f",
+					float64(atomic.SwapInt64(&ulB, 0))*8/e/1e6,
+					float64(atomic.SwapInt64(&dlB, 0))*8/e/1e6,
+					float64(atomic.SwapInt64(&ulP, 0))/e)
+				t0 = time.Now()
+			case <-statsDone:
+				return
+			}
+		}
+	}()
+	defer close(statsDone)
+
+	errCh := make(chan error, 2)
+	var wg sync.WaitGroup
+
+	// ── Upload: wireguard-go → TLS (batched) ──────────────────────────────
+	// wireguard-go calls bind.Send() → outCh. No WFP callouts, no loopback.
+	// We apply the same 1 ms coalescing window as the UDP path.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		batch := make([]byte, 0, 64*1024)
+		var hdr [frameHdrSize]byte
+		lastSent := time.Now()
+
+		flush := func() bool {
+			if len(batch) == 0 {
+				return true
+			}
+			if _, err := tlsConn.Write(batch); err != nil {
+				errCh <- err
+				return false
+			}
+			batch = batch[:0]
+			lastSent = time.Now()
+			return true
+		}
+
+		for {
+			select {
+			case pkt, ok := <-bind.outCh:
+				if !ok {
+					flush()
+					return
+				}
+				atomic.AddInt64(&ulP, 1)
+				atomic.AddInt64(&ulB, int64(len(pkt)))
+				writeFrame(hdr[:], len(pkt))
+				batch = append(batch, hdr[:]...)
+				batch = append(batch, pkt...)
+				if len(batch) >= 48*1024 {
+					if !flush() {
+						return
+					}
+				}
+
+			case <-ticker.C:
+				if !flush() {
+					return
+				}
+				if time.Since(lastSent) > 19*time.Second {
+					if _, err := tlsConn.Write(keepaliveFrame); err != nil {
+						errCh <- err
+						return
+					}
+					lastSent = time.Now()
+				}
+
+			case <-bind.done:
+				// SMTP session ended — stop this goroutine; wireguard-go
+				// will queue outbound packets in outCh until reconnect.
+				return
+			}
+		}
+	}()
+
+	// ── Download: TLS → wireguard-go ──────────────────────────────────────
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		hdr := make([]byte, frameHdrSize)
+		buf := make([]byte, maxPacketSize)
+		for {
+			if _, err := io.ReadFull(br, hdr); err != nil {
+				errCh <- err
+				return
+			}
+			n := readFrameLen(hdr)
+			if n == 0 {
+				continue // keepalive
+			}
+			if _, err := io.ReadFull(br, buf[:n]); err != nil {
+				errCh <- err
+				return
+			}
+			atomic.AddInt64(&dlB, int64(n))
+			bind.deliver(buf[:n])
+		}
+	}()
+
+	if err := <-errCh; err != nil && err != io.EOF &&
+		!strings.Contains(err.Error(), "use of closed") {
+		log.Printf("Tunnel: %v", err)
+	}
+	bind.closeDone()  // unblock upload goroutine's <-bind.done
+	tlsConn.Close()  // unblock download goroutine's ReadFull
+	wg.Wait()
 }
