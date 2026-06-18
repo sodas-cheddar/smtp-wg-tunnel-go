@@ -364,17 +364,12 @@ func (c *Client) runTunnel(tlsConn *tls.Conn, br *bufio.Reader) {
 }
 
 // ── WireGuard-go mode ──────────────────────────────────────────────────────────
-//
-// Runs when --wg flag is provided. wireguard-go IS the WireGuard implementation;
-// no external WireGuard-Windows app or UDP loopback needed.
-// The tunnelBind routes all WireGuard crypto frames through our SMTP tunnel.
 
 func (c *Client) RunWGMode(wgCfg *WGConfig) {
 	cfg := c.cfg
-
-	// Create TUN + wireguard-go with our custom bind
-	bind := newTunnelBind()
 	serverAddr := fmt.Sprintf("%s:%d", cfg.ServerHost, cfg.ServerPort)
+
+	bind := newTunnelBind()
 
 	tunDev, err := createAndConfigureTUN(wgCfg, cfg.ServerHost)
 	if err != nil {
@@ -388,11 +383,9 @@ func (c *Client) RunWGMode(wgCfg *WGConfig) {
 	}
 	defer dev.Close()
 
-	log.Printf("Embedded WireGuard active — all traffic routes via SMTP tunnel to %s", serverAddr)
-	log.Printf("No WireGuard-Windows app needed.")
+	log.Printf("Embedded wireguard-go active — no WireGuard-Windows app needed")
+	log.Printf("Connecting SMTP tunnel to %s …", serverAddr)
 
-	// Reconnect loop: SMTP tunnel reconnects transparently; wireguard-go
-	// keeps its TUN and crypto state across reconnects.
 	for {
 		select {
 		case <-c.stop:
@@ -404,7 +397,6 @@ func (c *Client) RunWGMode(wgCfg *WGConfig) {
 		if err != nil {
 			log.Printf("Connection failed: %v", err)
 		} else {
-			bind.resetDone() // fresh session signal for ReceiveFunc
 			c.runTunnelWG(tlsConn, br, bind)
 		}
 
@@ -417,13 +409,19 @@ func (c *Client) RunWGMode(wgCfg *WGConfig) {
 	}
 }
 
-// runTunnelWG is the same as runTunnel but sources/sinks are the tunnelBind
-// channels instead of a UDP socket.
+// runTunnelWG forwards WireGuard frames between wireguard-go and the SMTP TLS tunnel.
 //
-// Upload: bind.outCh  ← wireguard-go → batch → TLS write
-// Download: TLS read → decode frame → bind.deliver() → wireguard-go
+// Critical design: use a per-session sessionCh (closed when THIS session ends)
+// rather than bind.closeCh (which must survive across reconnects to keep
+// wireguard-go's ReceiveFunc goroutine alive). Closing bind.closeCh on every
+// disconnect would permanently terminate wireguard-go's receive loop, causing
+// every subsequent handshake to time out with wg_pps=0.
 func (c *Client) runTunnelWG(tlsConn *tls.Conn, br *bufio.Reader, bind *tunnelBind) {
 	defer tlsConn.Close()
+
+	// sessionCh signals this session's upload goroutine to stop.
+	// It is local — closing it does NOT affect bind or wireguard-go's internals.
+	sessionCh := make(chan struct{})
 
 	var ulB, dlB, ulP int64
 	t0 := time.Now()
@@ -435,10 +433,12 @@ func (c *Client) runTunnelWG(tlsConn *tls.Conn, br *bufio.Reader, bind *tunnelBi
 			select {
 			case <-t.C:
 				e := time.Since(t0).Seconds()
-				log.Printf("stats  ul=%.1f Mbps  dl=%.1f Mbps  wg_pps=%.0f",
+				log.Printf("stats  ul=%.1f Mbps  dl=%.1f Mbps  wg_pps=%.0f  (bind: sent=%d drops=%d)",
 					float64(atomic.SwapInt64(&ulB, 0))*8/e/1e6,
 					float64(atomic.SwapInt64(&dlB, 0))*8/e/1e6,
-					float64(atomic.SwapInt64(&ulP, 0))/e)
+					float64(atomic.SwapInt64(&ulP, 0))/e,
+					atomic.LoadInt64(&bind.sendCalls),
+					atomic.LoadInt64(&bind.sendDrops))
 				t0 = time.Now()
 			case <-statsDone:
 				return
@@ -450,9 +450,11 @@ func (c *Client) runTunnelWG(tlsConn *tls.Conn, br *bufio.Reader, bind *tunnelBi
 	errCh := make(chan error, 2)
 	var wg sync.WaitGroup
 
-	// ── Upload: wireguard-go → TLS (batched) ──────────────────────────────
-	// wireguard-go calls bind.Send() → outCh. No WFP callouts, no loopback.
-	// We apply the same 1 ms coalescing window as the UDP path.
+	// ── Upload: wireguard-go → TLS ─────────────────────────────────────────
+	// wireguard-go calls bind.Send() → packets land in bind.outCh.
+	// This goroutine drains outCh and batches into TLS writes every 1 ms.
+	// Uses sessionCh (NOT bind.closeCh) so wireguard-go's ReceiveFunc
+	// keeps running after this session ends.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -477,11 +479,7 @@ func (c *Client) runTunnelWG(tlsConn *tls.Conn, br *bufio.Reader, bind *tunnelBi
 
 		for {
 			select {
-			case pkt, ok := <-bind.outCh:
-				if !ok {
-					flush()
-					return
-				}
+			case pkt := <-bind.outCh:
 				atomic.AddInt64(&ulP, 1)
 				atomic.AddInt64(&ulB, int64(len(pkt)))
 				writeFrame(hdr[:], len(pkt))
@@ -505,15 +503,18 @@ func (c *Client) runTunnelWG(tlsConn *tls.Conn, br *bufio.Reader, bind *tunnelBi
 					lastSent = time.Now()
 				}
 
-			case <-bind.done:
-				// SMTP session ended — stop this goroutine; wireguard-go
-				// will queue outbound packets in outCh until reconnect.
+			case <-sessionCh:
+				flush()
 				return
 			}
 		}
 	}()
 
-	// ── Download: TLS → wireguard-go ──────────────────────────────────────
+	// ── Download: TLS → wireguard-go ───────────────────────────────────────
+	// Reads length-prefixed frames from the TLS stream and delivers raw
+	// WireGuard frames to wireguard-go via bind.deliver() → bind.inCh.
+	// wireguard-go's ReceiveFunc (started by dev.Up()) drains inCh and
+	// decrypts packets onto the TUN interface.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -537,11 +538,14 @@ func (c *Client) runTunnelWG(tlsConn *tls.Conn, br *bufio.Reader, bind *tunnelBi
 		}
 	}()
 
+	// Wait for first goroutine to report an error, then tear down this session.
+	// wireguard-go and the TUN interface are unaffected — they persist and will
+	// resume sending/receiving once the SMTP tunnel reconnects.
 	if err := <-errCh; err != nil && err != io.EOF &&
 		!strings.Contains(err.Error(), "use of closed") {
-		log.Printf("Tunnel: %v", err)
+		log.Printf("Session ended: %v", err)
 	}
-	bind.closeDone()  // unblock upload goroutine's <-bind.done
-	tlsConn.Close()  // unblock download goroutine's ReadFull
+	close(sessionCh)   // stop upload goroutine
+	tlsConn.Close()    // unblock download goroutine's ReadFull
 	wg.Wait()
 }

@@ -2,25 +2,25 @@ package main
 
 // wireguard.go — embedded WireGuard client using wireguard-go.
 //
-// Instead of relying on WireGuard-Windows (wireguard-nt or TunSafe), which
-// register Windows Filtering Platform callouts that add ~430 µs overhead per
-// outgoing UDP packet (capping upload at ~2,300 pps = 25 Mbps), our binary
-// runs wireguard-go in-process with a custom conn.Bind that routes all
-// WireGuard traffic through our SMTP tunnel instead of real UDP.
+// Eliminates the Windows Filtering Platform (WFP) callout overhead (~430 µs per
+// packet) that caps WireGuard-Windows upload at ~2,300 pps = 25 Mbps.
+// wireguard-go runs in-process with no kernel driver and no WFP hooks.
 //
-// Packet flow:
+// Transport design
+// ─────────────────
+// wireguard-go normally sends encrypted WireGuard frames over UDP.
+// Here we replace UDP with our SMTP tunnel via tunnelBind (conn.Bind):
 //
-//   App → OS TUN/wintun → wireguard-go encrypt → tunnelBind.Send() → SMTP TLS → VPS wg0 → internet
-//   App ← OS TUN/wintun ← wireguard-go decrypt ← tunnelBind.recv  ← SMTP TLS ← VPS wg0 ← internet
+//   App → TUN → wireguard-go encrypt → tunnelBind.Send() → outCh ──────→ SMTP TLS → VPS wg0 → internet
+//   App ← TUN ← wireguard-go decrypt ← tunnelBind.ReceiveFunc ← inCh ← SMTP TLS ← VPS wg0 ← internet
 //
-// The server side is UNCHANGED — it still forwards WireGuard frames via UDP
-// to the VPS's local wg0.
-//
-// No WireGuard-Windows app needed. Run:
-//   smtp-wg-tunnel.exe client -c client_config.yaml --wg wg0.conf
+// Key design rule: closeCh is ONLY closed when the WireGuard DEVICE shuts down.
+// Per-SMTP-session coordination uses a local sessionCh in runTunnelWG so that
+// wireguard-go's ReceiveFunc goroutine survives across reconnects.
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
@@ -33,21 +33,19 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
-	"bytes"
-	"time"
-
 	"golang.zx2c4.com/wireguard/tun"
 )
 
-// ── WireGuard config parsing ───────────────────────────────────────────────────
-// Parses the standard wg0.conf INI format.
+// ── WireGuard config ───────────────────────────────────────────────────────────
 
 type WGConfig struct {
-	PrivateKey string   // base64
-	Addresses  []string // e.g. ["10.0.0.2/32"]
+	PrivateKey string
+	Addresses  []string
 	DNS        []string
 	MTU        int
 	Peers      []WGPeer
@@ -55,8 +53,8 @@ type WGConfig struct {
 
 type WGPeer struct {
 	PublicKey           string
-	AllowedIPs         []string
-	Endpoint            string // original endpoint (ignored — we use SMTP tunnel)
+	AllowedIPs          []string
+	Endpoint            string
 	PersistentKeepalive int
 }
 
@@ -150,71 +148,62 @@ func b64ToHex(b64 string) (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// ── Custom conn.Bind — routes WireGuard over our SMTP tunnel ───────────────────
+// ── tunnelBind ─────────────────────────────────────────────────────────────────
 //
-// wireguard-go calls Send() to emit encrypted WireGuard frames.
-// Our tunnel goroutines call deliver() to push received frames in.
+// Implements conn.Bind. wireguard-go calls Send() to emit frames; our
+// SMTP goroutines call deliver() to push received frames in.
+//
+// Lifetime rules:
+//   • outCh / inCh persist for the life of the process.
+//   • closeCh is closed ONLY when the WireGuard device is shut down (dev.Close).
+//     Do NOT close it on SMTP session disconnect — that would permanently kill
+//     wireguard-go's ReceiveFunc goroutine and break all subsequent reconnects.
+//   • Per-SMTP-session teardown is handled by a local sessionCh in runTunnelWG.
 
 type tunnelBind struct {
-	outCh chan []byte  // wireguard-go → SMTP sender goroutine
-	inCh  chan []byte  // SMTP receiver goroutine → wireguard-go
-	done  chan struct{}
-	mu    sync.Mutex
-	dead  bool
+	outCh   chan []byte  // wireguard-go → SMTP upload goroutine
+	inCh    chan []byte  // SMTP download goroutine → wireguard-go ReceiveFunc
+	closeCh chan struct{} // closed only on device.Close()
+	closeOnce sync.Once
+
+	// debug counters
+	sendCalls  int64 // times wireguard-go called Send()
+	sendDrops  int64 // packets dropped because outCh was full
 }
 
 func newTunnelBind() *tunnelBind {
 	return &tunnelBind{
-		outCh: make(chan []byte, 1024),
-		inCh:  make(chan []byte, 1024),
-		done:  make(chan struct{}),
+		outCh:   make(chan []byte, 2048),
+		inCh:    make(chan []byte, 2048),
+		closeCh: make(chan struct{}),
 	}
 }
 
-// deliver pushes a received WireGuard packet to wireguard-go.
+// deliver pushes a received WireGuard packet to wireguard-go's ReceiveFunc.
 func (b *tunnelBind) deliver(pkt []byte) {
 	p := make([]byte, len(pkt))
 	copy(p, pkt)
 	select {
 	case b.inCh <- p:
-	default: // drop if wireguard-go is not consuming fast enough
+	default:
+		// wireguard-go isn't consuming fast enough — drop; WireGuard handles loss
 	}
 }
 
-// resetDone recreates the done channel for a fresh session (called after reconnect).
-// outCh/inCh are kept — wireguard-go keeps queuing/reading across reconnects.
-func (b *tunnelBind) resetDone() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.dead {
-		b.done = make(chan struct{})
-		b.dead = false
-	}
-}
-
-// closeDone signals the current SMTP session ended. wireguard-go's
-// ReceiveFunc will unblock and return ErrClosed, allowing a new session.
-func (b *tunnelBind) closeDone() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if !b.dead {
-		b.dead = true
-		close(b.done)
-	}
-}
-
-// ── conn.Bind interface ────────────────────────────────────────────────────────
+// ── conn.Bind ─────────────────────────────────────────────────────────────────
 
 func (b *tunnelBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
-	b.resetDone()
 	rf := func(bufs [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
+		// Block until wireguard-go delivers a packet from the SMTP tunnel, OR
+		// until the WireGuard device itself closes. Do NOT block on any
+		// per-session channel here — this goroutine must survive reconnects.
 		select {
 		case pkt := <-b.inCh:
 			n := copy(bufs[0], pkt)
 			sizes[0] = n
 			eps[0] = &wgEndpoint{}
 			return 1, nil
-		case <-b.done:
+		case <-b.closeCh:
 			return 0, net.ErrClosed
 		}
 	}
@@ -222,7 +211,8 @@ func (b *tunnelBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 }
 
 func (b *tunnelBind) Close() error {
-	b.closeDone()
+	// Called by device.Close() — signal the ReceiveFunc to exit.
+	b.closeOnce.Do(func() { close(b.closeCh) })
 	return nil
 }
 
@@ -235,9 +225,11 @@ func (b *tunnelBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 		}
 		pkt := make([]byte, len(buf))
 		copy(pkt, buf)
+		atomic.AddInt64(&b.sendCalls, 1)
 		select {
 		case b.outCh <- pkt:
-		default: // drop if sender is blocked; WireGuard handles retransmits
+		default:
+			atomic.AddInt64(&b.sendDrops, 1)
 		}
 	}
 	return nil
@@ -249,56 +241,59 @@ func (b *tunnelBind) ParseEndpoint(s string) (conn.Endpoint, error) {
 
 func (b *tunnelBind) BatchSize() int { return 1 }
 
-// ── conn.Endpoint (minimal — we use a single SMTP tunnel, not UDP) ─────────────
+// ── conn.Endpoint ──────────────────────────────────────────────────────────────
 
 type wgEndpoint struct{ addr string }
 
-func (e *wgEndpoint) ClearSrc()           {}
-func (e *wgEndpoint) SrcToString() string  { return "" }
-func (e *wgEndpoint) DstToString() string  { return e.addr }
-func (e *wgEndpoint) DstToBytes() []byte   { return []byte(e.addr) }
-func (e *wgEndpoint) DstIP() netip.Addr    { return netip.Addr{} }
-func (e *wgEndpoint) SrcIP() netip.Addr    { return netip.Addr{} }
+func (e *wgEndpoint) ClearSrc()          {}
+func (e *wgEndpoint) SrcToString() string { return "" }
+func (e *wgEndpoint) DstToString() string { return e.addr }
+func (e *wgEndpoint) DstToBytes() []byte  { return []byte(e.addr) }
+func (e *wgEndpoint) DstIP() netip.Addr   { return netip.Addr{} }
+func (e *wgEndpoint) SrcIP() netip.Addr   { return netip.Addr{} }
 
-// ── TUN interface setup ────────────────────────────────────────────────────────
+// ── TUN creation + IP configuration ───────────────────────────────────────────
 
 func createAndConfigureTUN(cfg *WGConfig, serverHost string) (tun.Device, error) {
 	mtu := cfg.MTU
 	if mtu <= 0 {
 		mtu = 1420
 	}
-
 	log.Printf("Creating TUN interface (MTU %d)…", mtu)
 	tunDev, err := tun.CreateTUN("wg0", mtu)
 	if err != nil {
 		return nil, fmt.Errorf("tun.CreateTUN: %w\n"+
 			"  On Windows, wintun.dll must be in the same directory or System32.\n"+
-			"  Download from https://wintun.net/ or reinstall WireGuard-Windows.", err)
+			"  Download: https://wintun.net/", err)
 	}
-
 	name, err := tunDev.Name()
 	if err != nil {
 		tunDev.Close()
 		return nil, err
 	}
-	log.Printf("TUN interface ready: %s", name)
+	log.Printf("TUN interface: %s", name)
 
-	// Add a bypass route for the SMTP server so it doesn't loop through TUN
+	// Add bypass route for the SMTP server before AllowedIPs routes go in,
+	// so our own connection doesn't get routed through the tunnel.
 	if serverHost != "" {
 		if gw, err := defaultGateway(); err == nil {
-			_ = addBypassRoute(serverHost, gw) // best-effort
+			if err := addBypassRoute(serverHost, gw); err != nil {
+				log.Printf("Warning: bypass route for %s: %v (add manually if needed)", serverHost, err)
+			} else {
+				log.Printf("Bypass route added: %s via %s", serverHost, gw)
+			}
+		} else {
+			log.Printf("Warning: could not detect default gateway: %v", err)
 		}
 	}
 
 	if err := applyTUNConfig(name, cfg); err != nil {
 		log.Printf("Warning: TUN config incomplete: %v", err)
-		log.Printf("Run manually: ip addr add <addr> dev %s && ip link set %s up", name, name)
 	}
-
 	return tunDev, nil
 }
 
-func run(name string, args ...string) error {
+func runCmd(name string, args ...string) error {
 	out, err := exec.Command(name, args...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s %v: %w: %s", name, args, err, bytes.TrimSpace(out))
@@ -313,18 +308,17 @@ func defaultGateway() (string, error) {
 		if err != nil {
 			return "", err
 		}
-		// format: "default via GW dev DEV …"
 		parts := strings.Fields(string(out))
 		for i, p := range parts {
 			if p == "via" && i+1 < len(parts) {
 				return parts[i+1], nil
 			}
 		}
-		return "", fmt.Errorf("no default gateway found")
+		return "", fmt.Errorf("no gateway in: %s", string(out))
 
 	case "windows":
 		out, err := exec.Command("powershell", "-NoProfile", "-Command",
-			`(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric | Select-Object -First 1).NextHop`,
+			`(Get-NetRoute -DestinationPrefix '0.0.0.0/0'|Sort-Object RouteMetric|Select-Object -First 1).NextHop`,
 		).Output()
 		if err != nil {
 			return "", err
@@ -344,7 +338,7 @@ func defaultGateway() (string, error) {
 				}
 			}
 		}
-		return "", fmt.Errorf("no gateway in route output")
+		return "", fmt.Errorf("no gateway found")
 	}
 	return "", fmt.Errorf("unsupported OS: %s", runtime.GOOS)
 }
@@ -352,11 +346,11 @@ func defaultGateway() (string, error) {
 func addBypassRoute(host, gw string) error {
 	switch runtime.GOOS {
 	case "linux":
-		return run("ip", "route", "add", host+"/32", "via", gw)
+		return runCmd("ip", "route", "add", host+"/32", "via", gw)
 	case "windows":
-		return run("route", "add", host, "mask", "255.255.255.255", gw)
+		return runCmd("route", "add", host, "mask", "255.255.255.255", gw)
 	case "darwin":
-		return run("route", "add", "-host", host, gw)
+		return runCmd("route", "add", "-host", host, gw)
 	}
 	return nil
 }
@@ -365,27 +359,27 @@ func applyTUNConfig(iface string, cfg *WGConfig) error {
 	switch runtime.GOOS {
 	case "linux":
 		for _, addr := range cfg.Addresses {
-			if err := run("ip", "address", "add", addr, "dev", iface); err != nil {
+			if err := runCmd("ip", "address", "add", addr, "dev", iface); err != nil {
 				return err
 			}
 		}
-		if err := run("ip", "link", "set", iface, "up"); err != nil {
+		if err := runCmd("ip", "link", "set", iface, "up"); err != nil {
 			return err
 		}
 		for _, p := range cfg.Peers {
 			for _, aip := range p.AllowedIPs {
-				run("ip", "route", "add", aip, "dev", iface) //nolint
+				runCmd("ip", "route", "add", aip, "dev", iface) //nolint
 			}
 		}
 
 	case "windows":
-		time.Sleep(500 * time.Millisecond) // wait for interface to appear in netsh
+		time.Sleep(500 * time.Millisecond)
 		for _, addr := range cfg.Addresses {
-			run("netsh", "interface", "ip", "add", "address", iface, addr) //nolint
+			runCmd("netsh", "interface", "ip", "add", "address", iface, addr) //nolint
 		}
 		for _, p := range cfg.Peers {
 			for _, aip := range p.AllowedIPs {
-				run("route", "add", aip, iface) //nolint
+				runCmd("route", "add", aip, iface) //nolint
 			}
 		}
 
@@ -393,19 +387,20 @@ func applyTUNConfig(iface string, cfg *WGConfig) error {
 		for _, addr := range cfg.Addresses {
 			ip, _, _ := net.ParseCIDR(addr)
 			if ip != nil {
-				run("ifconfig", iface, ip.String(), ip.String(), "alias") //nolint
+				runCmd("ifconfig", iface, ip.String(), ip.String(), "alias") //nolint
 			}
 		}
-		run("ifconfig", iface, "up") //nolint
+		runCmd("ifconfig", iface, "up") //nolint
 		for _, p := range cfg.Peers {
 			for _, aip := range p.AllowedIPs {
-				run("route", "add", "-net", aip, "-interface", iface) //nolint
+				runCmd("route", "add", "-net", aip, "-interface", iface) //nolint
 			}
 		}
 	}
 
 	if len(cfg.DNS) > 0 {
-		log.Printf("DNS servers (%s) — configure manually or via your OS resolver", strings.Join(cfg.DNS, ", "))
+		log.Printf("DNS %s — configure via your OS resolver (e.g. resolvconf, systemd-resolved, netsh)",
+			strings.Join(cfg.DNS, ", "))
 	}
 	return nil
 }
@@ -433,9 +428,9 @@ func newWireGuardDevice(tunDev tun.Device, bind *tunnelBind, cfg *WGConfig, serv
 		if err != nil {
 			return nil, fmt.Errorf("peer public key: %w", err)
 		}
-		// The endpoint must be a host:port so wireguard-go can associate
-		// responses with this peer. We use a dummy port since our bind
-		// ignores the UDP address entirely.
+		// Endpoint is required by wireguard-go for peer routing, but our
+		// tunnelBind.Send() ignores it — we have only one SMTP tunnel.
+		// Use a dummy valid-looking host:port so wireguard-go doesn't reject it.
 		ep := serverAddr
 		if ep == "" {
 			ep = "0.0.0.0:51820"
@@ -453,12 +448,12 @@ func newWireGuardDevice(tunDev tun.Device, bind *tunnelBind, cfg *WGConfig, serv
 
 	if err := dev.IpcSet(sb.String()); err != nil {
 		dev.Close()
-		return nil, fmt.Errorf("wireguard IPC: %w", err)
+		return nil, fmt.Errorf("wireguard IpcSet: %w", err)
 	}
 	if err := dev.Up(); err != nil {
 		dev.Close()
 		return nil, fmt.Errorf("wireguard Up: %w", err)
 	}
-	log.Println("wireguard-go device up")
+	log.Println("wireguard-go device up — handshake will begin once SMTP tunnel connects")
 	return dev, nil
 }
